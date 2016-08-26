@@ -122,14 +122,14 @@ to solve the problem:
     rsync -e '/path/to/ssh-ident' ...
     scp -S '/path/to/ssh-ident' ...
 
-4) Replace the real ssh on the system with ssh-ident, and set the 
+4) Replace the real ssh on the system with ssh-ident, and set the
    BINARY_SSH configuration parameter to the original value.
 
    On Debian based system, you can make this change in a way that
    will survive automated upgrades and audits by running:
 
      dpkg-divert --divert /usr/bin/ssh.ssh-ident --rename /usr/bin/ssh
-   
+
    After which, you will need to use:
 
      BINARY_SSH="/usr/bin/ssh.ssh-ident"
@@ -814,24 +814,102 @@ class AgentManager(object):
 def AutodetectBinary(argv, config):
   """Detects the correct binary to run and sets BINARY_SSH accordingly,
   if it is not already set."""
+
+  # Set default binary to use, in case the binary can't be found otherwise.
+  DEFAULT_BINARY = "ssh"
+
   # If BINARY_SSH is set by the user, respect that and do nothing.
   if config.Get("BINARY_SSH"):
     print("Will run '{0}' as ssh binary - set by user via BINARY_SSH"
           .format(config.Get("BINARY_SSH")), loglevel=LOG_DEBUG)
     return
 
-  # If BINARY_DIR is set, look for the binary in this directory.
+  # Get name of running programe
   runtime_name = argv[0]
-  if config.Get("BINARY_DIR"):
-    binary_name = os.path.basename(runtime_name)
-    binary_path = os.path.join(config.Get("BINARY_DIR"), binary_name)
-    if not os.path.isfile(binary_path) or not os.access(binary_path, os.X_OK):
-      binary_path = os.path.join(config.Get("BINARY_DIR"), "ssh")
+  binary_name = os.path.basename(runtime_name)
 
+  # Look for runtime_name or DEFAULT_BINARY in BINARY_DIR.
+  binary_dir = config.Get("BINARY_DIR")
+  if binary_dir:
+    # Use first valid find between the runtime binary and the default binary.
+    binaries = [FindBinaryInDirectory(binary_dir, name)
+                for name in (binary_name, DEFAULT_BINARY)]
+    binary_path = next((path for path in binaries if path is not None), None)
+    if binary_path:
+      config.Set("BINARY_SSH", binary_path)
+      print("Will run '{0}' as ssh binary - detected based on BINARY_DIR"
+            .format(binary_path), loglevel=LOG_DEBUG)
+      return
+
+  # Look for runtime_name or DEFAULT_BINARY in PATH.
+  # Use first valid find between the runtime binary and the default binary.
+  binaries = [FindAutodetectBinaryInPath(name)
+              for name in (runtime_name, DEFAULT_BINARY)]
+  binary_path = next((path for path in binaries if path is not None), None)
+  if binary_path:
     config.Set("BINARY_SSH", binary_path)
-    print("Will run '{0}' as ssh binary - deteced based on BINARY_DIR"
+    print("Will run '{0}' as ssh binary - detected from argv[0] and $PATH"
           .format(config.Get("BINARY_SSH")), loglevel=LOG_DEBUG)
-    return
+  else:
+    message = textwrap.dedent("""\
+    ssh-ident was invoked in place of the binary {0} (determined from argv[0]).
+    Neither this binary nor 'ssh' could be found in $PATH.
+
+      PATH="{1}"
+
+    You need to adjust your setup for ssh-ident to work: consider setting
+    BINARY_SSH or BINARY_DIR in your config, or running ssh-ident some
+    other way.""")
+    print(message.format(argv[0], os.environ['PATH']), loglevel=LOG_ERROR)
+    sys.exit(255)
+
+
+def GetNormalizedSystemPath():
+  """Returns a the system PATH as a list, with symlinks etc.
+  being normalized."""
+  # Paths in PATH may be not-normalized, example: "/usr/bin/../foo",
+  # or "/opt/scripts///". Normalize them before comparison.
+  normalized_path = [
+    os.path.normpath(p) for p in os.environ['PATH'].split(os.pathsep)]
+
+  return normalized_path
+
+def FindBinaryInDirectory(binary_dir, binary_name):
+  """Looks for an executable with a given name in a given directory and
+  returns the binary path if it was found."""
+  binary_path = os.path.join(binary_dir, binary_name)
+  if os.path.isfile(binary_path) and os.access(binary_path, os.X_OK):
+    return binary_path
+  else:
+    return None
+
+def FindBinaryInPath(binary_name, search_path=None):
+  """Looks for an executable with a given name in a given directory and
+  returns the binary path if it was found."""
+  if not search_path:
+    search_path = GetNormalizedSystemPath()
+
+  # Find an executable with the desired name.
+  binary_path = distutils.spawn.find_executable(binary_name, search_path)
+
+  return binary_path
+
+def FindBinary(binary_dir, binary_name):
+  """Looks for an executable binary_name in binary_dir and PATH and
+  returns the binary path if it was found."""
+  if binary_dir:
+    binary_path = FindBinaryInDirectory(binary_dir, binary_name)
+    if binary_path:
+      return binary_path
+
+  # Look for binary in PATH.
+  binary_path = FindBinaryInPath(binary_name)
+  if binary_path:
+    return binary_path
+
+def FindAutodetectBinaryInPath(runtime_name):
+  """Looks for the correct binary that is supposed to runin PATH and returns
+  the binary path if it was found."""
 
   # argv[0] could be pretty much anything the caller decides to set
   # it to: an absolute path, a relative path (common in older systems),
@@ -845,7 +923,7 @@ def AutodetectBinary(argv, config):
   # The logic here is pretty straightforward:
   # - Try to eliminate the path of ssh-ident from PATH.
   # - Search for a binary with the same name of ssh-ident to run.
-  # 
+  #
   # If this fails, we may end up in some sort of loop, where ssh-ident
   # tries to run itself. This should normally be detected later on,
   # where the code checks for the next binary to run.
@@ -873,37 +951,13 @@ def AutodetectBinary(argv, config):
   # Remove the path containing the ssh-ident symlink (or whatever) from
   # the search path, so we do not cause an infinite loop.
   # Note that:
-  #  - paths in PATH may be not-normalized, example: "/usr/bin/../foo",
-  #    or "/opt/scripts///". Normalize them before comparison.
   #  - paths in PATH may be repeated multiple times. We have to exclude
   #    all instances of the ssh-ident path.
-  normalized_path = [
-      os.path.normpath(p) for p in os.environ['PATH'].split(os.pathsep)]
+  normalized_path = GetNormalizedSystemPath()
   search_path = os.pathsep.join([
       p for p in normalized_path if p != ssh_ident_path])
 
-  # Find an executable with the desired name.
-  binary_path = distutils.spawn.find_executable(binary_name, search_path)
-  if not binary_path:
-    # Nothing found. Try to find something named 'ssh'.
-    binary_path = distutils.spawn.find_executable('ssh')
-
-  if binary_path:
-    config.Set("BINARY_SSH", binary_path)
-    print("Will run '{0}' as ssh binary - deteced from argv[0] and $PATH"
-          .format(config.Get("BINARY_SSH")), loglevel=LOG_DEBUG)
-  else:
-    message = textwrap.dedent("""\
-    ssh-ident was invoked in place of the binary {0} (determined from argv[0]).
-    Neither this binary nor 'ssh' could be found in $PATH.
-
-      PATH="{1}" 
-
-    You need to adjust your setup for ssh-ident to work: consider setting
-    BINARY_SSH or BINARY_DIR in your config, or running ssh-ident some
-    other way.""")
-    print(message.format(argv[0], os.environ['PATH']), loglevel=LOG_ERROR)
-    sys.exit(255)
+  return FindBinaryInPath(binary_name, search_path)
 
 def ParseCommandLine(argv, config):
   """Parses the command line parameters in argv
@@ -942,6 +996,7 @@ def main(argv):
   print = SshIdentPrint(config)
 
   AutodetectBinary(argv, config)
+
   # Check that BINARY_SSH is not ssh-ident.
   # This can happen if the user sets a binary name only (e.g. 'scp') and a
   # symlink with the same name was set up.
@@ -956,8 +1011,8 @@ def main(argv):
     message = textwrap.dedent("""\
     ssh-ident found '{0}' as the next command to run.
     Based on argv[0] ({1}), it seems like this will create a
-    loop. 
-    
+    loop.
+
     Please use BINARY_SSH, BINARY_DIR, or change the way
     ssh-ident is invoked (eg, a different argv[0]) to make
     it work correctly.""")
